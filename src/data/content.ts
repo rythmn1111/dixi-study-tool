@@ -1413,4 +1413,706 @@ print(classification_report(y_true, y_pred))
       },
     ],
   },
+
+  {
+    id: 'project-recommendations',
+    number: 15,
+    title: 'Project: Personalized Product Recommendations',
+    description: 'LangChain + React + MRKL — deep walkthrough of everything in this project',
+    icon: '🛍️',
+    color: '#f59e0b',
+    tag: 'Project Deep Dive',
+    sections: [
+      {
+        id: 'proj-rec-overview',
+        title: 'Project Overview & Architecture',
+        content: `This project is a Generative AI-powered fashion recommendation system. Understanding every layer is critical because interviewers will drill into the design decisions.
+
+**What it does:**
+Users type natural language queries — "I want something casual for a beach trip" — and the system responds with personalized product recommendations that account for current fashion trends and the user's purchase history.
+
+**High-level Architecture:**
+1. **React frontend** — chat-style UI where users type queries
+2. **FastAPI/Express backend** — receives requests, orchestrates the agent
+3. **LangChain MRKL Agent** — the AI brain; routes to the right tools
+4. **Tool 1: User History Service** — fetches past purchases from MongoDB
+5. **Tool 2: Fashion Trends Tool** — queries trend data (scraped/API)
+6. **Tool 3: Product Catalog Search** — vector search over product embeddings
+7. **LLM (GPT-4)** — synthesizes tool outputs into natural language recommendations
+
+**Why this architecture over a single LLM call?**
+A single prompt like "recommend products for this user" has no access to live data. The agent architecture lets the LLM pull real user data, current trends, and live inventory dynamically. Each tool is best-in-class for its job; the LLM only does reasoning and synthesis.
+
+**Data Flow:**
+User query → React → POST /recommend → LangChain Agent → (Tool calls) → GPT-4 synthesis → Response → React renders cards`,
+        keyPoints: [
+          'MRKL pattern: LLM as router/reasoner, specialized tools handle data retrieval',
+          'Three tools: UserHistoryTool, FashionTrendsTool, ProductCatalogSearch',
+          'Agent decides which tools to call and in what order based on the query',
+          'Vector search on product embeddings enables semantic similarity matching',
+          'React frontend sends query + userId; backend is stateless between requests',
+          'GPT-4 synthesizes tool outputs into coherent, personalized natural language',
+        ],
+        interviewQs: [
+          {
+            q: 'Walk me through your product recommendation system end to end.',
+            a: 'User types a query in the React UI (e.g., "casual beach outfit"). The frontend POST-s the query and userId to a FastAPI endpoint. The backend initializes a LangChain MRKL agent with three tools: UserHistoryTool (retrieves past purchases from MongoDB), FashionTrendsTool (returns current trend data for the inferred style), and ProductCatalogSearch (semantic vector search over product embeddings). The agent\'s LLM (GPT-4) reasons about the query: "First I need the user\'s style preference from their history, then check what\'s trending in that style, then find matching products." It calls each tool in sequence, observes results, and synthesizes a final response. The backend returns structured product cards + a natural language explanation. React renders the cards.',
+          },
+          {
+            q: 'Why did you use MRKL/agents instead of a simple RAG or direct LLM call?',
+            a: 'Three reasons: (1) Dynamic data — user purchase history changes constantly; baking it into a static knowledge base doesn\'t work. Tools fetch live data at query time. (2) Multiple data sources — the system needs three different data sources (user DB, trend data, product catalog) that have different access patterns. An agent routes to the right source based on the query. (3) Reasoning capability — for a query like "what\'s popular in streetwear that matches my style?", the system needs to infer the user\'s style first, then look up trends for that style. The agent\'s reasoning loop handles this multi-step logic naturally. A single RAG call can\'t do conditional multi-step data retrieval.',
+          },
+        ],
+      },
+      {
+        id: 'proj-rec-tools',
+        title: 'Tool Implementation & Agent Design',
+        content: `The quality of an MRKL agent depends almost entirely on how well the tools are designed. Each tool needs a clear contract: what it accepts, what it returns, and most critically — the description the LLM reads to decide when to call it.
+
+**Tool Design Principles:**
+- **Name:** Short, descriptive, PascalCase
+- **Description:** This is what the LLM reads. Be specific about what the tool does, what input it expects, and when to use it. Vague descriptions = tool misuse.
+- **Input:** Keep it simple — a single string the LLM can easily produce
+- **Output:** Always return a string; include enough context for the LLM to reason about
+
+**UserHistoryTool:**
+- Input: user_id string
+- Output: structured text — list of past purchases with category, price, date
+- Description: "Retrieves the purchase history and style preferences for a user. Use when you need to understand a user's taste, preferred categories, or price range. Input: user_id"
+
+**FashionTrendsTool:**
+- Input: style/category string (e.g., "streetwear", "formal", "bohemian")
+- Output: current trending items, colors, fits for that style
+- Description: "Returns current fashion trends for a given clothing style or category. Use to understand what's popular and in-season. Input: style name or clothing category"
+
+**ProductCatalogSearch:**
+- Input: natural language product description
+- Output: top 5 matching products with name, price, category, image URL
+- Uses vector similarity search under the hood — the tool wrapper handles embedding generation and Chroma/Pinecone query
+- Description: "Searches the product catalog for items matching a description. Use to find specific products to recommend. Input: product description"
+
+**Agent Loop (what actually happens at runtime):**
+The agent receives the user query and enters a Thought → Action → Observation loop:
+1. Thought: "I need to understand this user's preferences before recommending"
+2. Action: UserHistoryTool[user_id=42]
+3. Observation: "Past purchases: sneakers (Sports), hoodies (Casual), cargo pants (Streetwear)"
+4. Thought: "User likes streetwear. Let me check current trends."
+5. Action: FashionTrendsTool[streetwear]
+6. Observation: "Trending: oversized silhouettes, earth tones, utility pockets"
+7. Thought: "Now find products matching user's style and current trends"
+8. Action: ProductCatalogSearch[oversized earth tone streetwear pants]
+9. Final Answer: synthesis of all above`,
+        keyPoints: [
+          'Tool description is what the LLM reads — vague descriptions cause tool misuse',
+          'Always return strings from tools; keep output structured but readable',
+          'The ReAct loop (Thought → Action → Observation) continues until Final Answer',
+          'ProductCatalogSearch wraps vector search — the agent just passes a description',
+          'verbose=True in LangChain shows the full reasoning trace for debugging',
+          'max_iterations prevents infinite loops; typically set to 5–10',
+        ],
+        codeExample: {
+          language: 'python',
+          label: 'Full MRKL agent implementation',
+          code: `from langchain.agents import initialize_agent, Tool, AgentType
+from langchain.chat_models import ChatOpenAI
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import Chroma
+from pymongo import MongoClient
+
+# Setup
+db = MongoClient("mongodb://localhost:27017")["fashion"]
+embeddings = OpenAIEmbeddings()
+product_store = Chroma(persist_directory="./product_db",
+                       embedding_function=embeddings)
+
+def get_user_history(user_id: str) -> str:
+    user = db.users.find_one({"_id": user_id})
+    if not user:
+        return "No history found for this user."
+    purchases = user.get("purchases", [])
+    summary = ", ".join([
+        f"{p['product']} ({p['category']}, $\{p['price']})"
+        for p in purchases[-10:]  # last 10 purchases
+    ])
+    return f"Recent purchases: {summary}"
+
+def get_fashion_trends(style: str) -> str:
+    # In production: call a trends API or query a curated database
+    trends_db = {
+        "streetwear": "Trending: oversized hoodies, cargo pants, chunky sneakers, earth tones",
+        "casual": "Trending: linen sets, minimalist tees, straight-leg jeans, neutral palettes",
+        "formal": "Trending: structured blazers, wide-leg trousers, monochrome looks",
+    }
+    style_lower = style.lower()
+    for key in trends_db:
+        if key in style_lower:
+            return trends_db[key]
+    return f"Trending in {style}: classic silhouettes, quality basics"
+
+def search_products(query: str) -> str:
+    results = product_store.similarity_search(query, k=5)
+    if not results:
+        return "No matching products found."
+    items = []
+    for doc in results:
+        m = doc.metadata
+        items.append(f"- {m['name']} | $\{m['price']} | {m['category']}")
+    return "Matching products:\n" + "\n".join(items)
+
+tools = [
+    Tool(
+        name="UserHistory",
+        func=get_user_history,
+        description=(
+            "Retrieves purchase history and style preferences for a user. "
+            "Use when you need to understand a user's taste, preferred categories, "
+            "or price range. Input: user_id as a string."
+        )
+    ),
+    Tool(
+        name="FashionTrends",
+        func=get_fashion_trends,
+        description=(
+            "Returns current fashion trends for a given clothing style or category. "
+            "Use to understand what's popular and in-season before making recommendations. "
+            "Input: style name (e.g. 'streetwear', 'casual', 'formal')."
+        )
+    ),
+    Tool(
+        name="ProductSearch",
+        func=search_products,
+        description=(
+            "Searches the product catalog using semantic similarity. "
+            "Use to find specific products that match the recommendation criteria. "
+            "Input: natural language product description."
+        )
+    ),
+]
+
+llm = ChatOpenAI(model="gpt-4", temperature=0)
+agent = initialize_agent(
+    tools=tools,
+    llm=llm,
+    agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+    verbose=True,
+    max_iterations=8,
+    early_stopping_method="generate"
+)
+
+# FastAPI endpoint
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+app = FastAPI()
+
+class RecommendRequest(BaseModel):
+    user_id: str
+    query: str
+
+@app.post("/recommend")
+async def recommend(req: RecommendRequest):
+    prompt = f"User ID: {req.user_id}. User query: '{req.query}'. Recommend products."
+    result = agent.run(prompt)
+    return {"recommendation": result}`,
+        },
+        interviewQs: [
+          {
+            q: 'How do you handle cases where the agent calls the wrong tool or gets stuck?',
+            a: 'Several defensive measures: (1) max_iterations — hard limit on agent steps, prevents infinite loops. (2) early_stopping_method="generate" — when iterations are exhausted, LLM generates a best-effort answer rather than crashing. (3) Clear tool descriptions — most wrong-tool calls trace back to ambiguous descriptions. (4) Output parsing — LangChain parsers validate that the agent produces valid Action/Action Input format; malformed output triggers a retry with a correction prompt. (5) Logging — verbose=True in dev logs every Thought/Action/Observation for debugging. (6) Fallback response — if the agent fails completely, return a generic recommendation rather than an error to the user.',
+          },
+          {
+            q: 'How did you build the product catalog vector index?',
+            a: 'Product indexing pipeline: (1) Load product catalog from database (name, description, category, price, tags). (2) Create embedding text for each product: concatenate name + category + description + tags into one string. (3) Generate embeddings via OpenAI text-embedding-ada-002 API (batched for efficiency). (4) Store in Chroma with product metadata (id, name, price, image_url). This is a one-time offline step; re-run when catalog changes. At query time: the ProductSearch tool takes the agent\'s natural language description, embeds it with the same model, and runs cosine similarity search. The tool returns the top-5 results formatted as a string the agent can reason about.',
+          },
+        ],
+      },
+      {
+        id: 'proj-rec-frontend',
+        title: 'React Frontend & Integration',
+        content: `The React frontend is the user-facing layer. For interviews, be ready to explain component structure, state management, and how the UI connects to the AI backend.
+
+**Component Structure:**
+- **App:** Root; holds chat history state
+- **ChatWindow:** Scrollable message list
+- **MessageBubble:** Renders user or assistant message; handles loading state
+- **ProductCard:** Displays a single recommended product (image, name, price, reason)
+- **QueryInput:** Text input + send button; handles submit
+
+**State Management:**
+All state lives in App via useState. No Redux needed for this scale:
+- messages: array of {role, content, products?}
+- isLoading: boolean for the typing indicator
+- error: string | null
+
+**Streaming Responses:**
+For a better UX, the backend can stream GPT-4 output token by token. The frontend uses the EventSource API (Server-Sent Events) or fetch with a ReadableStream. React's setState is called on each chunk, updating the assistant message progressively — the "typing" effect.
+
+**Key Integration Pattern:**
+POST /recommend with {userId, query} → response has {recommendation: string, products: Product[]}. The recommendation is the natural language text; products is the parsed list from the agent's tool calls (extracted by the backend before returning).
+
+**Error States:**
+Always handle: network errors, API timeouts (set fetch timeout to 30s for LLM calls), empty results. Show user-friendly messages, not raw error objects.`,
+        keyPoints: [
+          'Component hierarchy: App → ChatWindow → MessageBubble → ProductCard',
+          'State in App: messages array, isLoading, error — no external state library needed',
+          'Streaming: SSE or ReadableStream for typewriter effect on LLM responses',
+          'Set generous timeouts (30s+) for LLM API calls — they can be slow',
+          'Extract structured product data server-side before returning to React',
+          'useCallback for memoizing submit handler; prevents unnecessary re-renders',
+        ],
+        codeExample: {
+          language: 'tsx',
+          label: 'React chat UI with streaming',
+          code: `import { useState, useRef, useEffect } from 'react';
+
+interface Message {
+  role: 'user' | 'assistant';
+  content: string;
+  products?: Product[];
+}
+
+interface Product {
+  name: string;
+  price: number;
+  category: string;
+  reason: string;
+}
+
+export function RecommendationChat({ userId }: { userId: string }) {
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [input, setInput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  // Auto-scroll to latest message
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  const handleSubmit = async () => {
+    if (!input.trim() || isLoading) return;
+    const query = input.trim();
+    setInput('');
+    setMessages(prev => [...prev, { role: 'user', content: query }]);
+    setIsLoading(true);
+
+    try {
+      const res = await fetch('/api/recommend', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId, query }),
+        signal: AbortSignal.timeout(30000), // 30s timeout for LLM
+      });
+      if (!res.ok) throw new Error('API error');
+      const data = await res.json();
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: data.recommendation,
+        products: data.products,
+      }]);
+    } catch (err) {
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: "Sorry, I couldn't get recommendations right now. Please try again.",
+      }]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-screen max-w-2xl mx-auto">
+      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        {messages.map((msg, i) => (
+          <div key={i} className={msg.role === 'user' ? 'text-right' : 'text-left'}>
+            <div className={
+              msg.role === 'user'
+                ? 'inline-block bg-indigo-600 text-white rounded-2xl px-4 py-2'
+                : 'inline-block bg-gray-100 rounded-2xl px-4 py-2'
+            }>
+              {msg.content}
+            </div>
+            {msg.products && (
+              <div className="grid grid-cols-2 gap-3 mt-3">
+                {msg.products.map((p, j) => (
+                  <ProductCard key={j} product={p} />
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
+        {isLoading && <TypingIndicator />}
+        <div ref={bottomRef} />
+      </div>
+      <div className="p-4 border-t flex gap-2">
+        <input
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && handleSubmit()}
+          placeholder="What are you looking for today?"
+          className="flex-1 border rounded-xl px-4 py-2"
+        />
+        <button onClick={handleSubmit} disabled={isLoading}
+          className="bg-indigo-600 text-white px-6 py-2 rounded-xl disabled:opacity-50">
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}`,
+        },
+        interviewQs: [
+          {
+            q: 'How does the React frontend communicate with the LangChain backend?',
+            a: 'The frontend makes a POST request to /api/recommend with {userId, query}. The backend (FastAPI) receives this, constructs the agent prompt, runs the MRKL agent synchronously (or async with asyncio), and extracts structured product data from the agent\'s tool call results before returning. The response is {recommendation: string, products: Product[]}. React updates message state with both pieces. For production, streaming responses (SSE) can be added: the backend streams GPT-4 tokens as they arrive using OpenAI\'s streaming API, and the frontend appends each chunk to the in-progress assistant message using a ReadableStream reader.',
+          },
+        ],
+      },
+      {
+        id: 'proj-rec-challenges',
+        title: 'Challenges, Trade-offs & What You\'d Improve',
+        content: `Interviewers love "what were the challenges" and "what would you do differently" questions. Have concrete answers.
+
+**Challenges Faced:**
+
+**1. Agent Non-determinism**
+The agent doesn't always call tools in the same order or the same number of times. In testing, the same query sometimes produced different recommendation sets. Solution: lower temperature (temperature=0), add explicit instructions in the system prompt about the expected reasoning flow, add logging to track and debug divergent runs.
+
+**2. Product Embedding Quality**
+Early versions embedded only product names. Results were poor because "blue cargo pants" and "navy utility trousers" weren't similar enough. Solution: enriched embedding text to include category, material, style tags, and product description. Similarity scores improved significantly.
+
+**3. Latency**
+3 tool calls + GPT-4 synthesis = 5–8 seconds per request. Users found this slow. Mitigations: (1) streaming responses — start showing output as it generates, (2) cache user history (doesn't change per request), (3) async tool calls where possible, (4) show a "thinking..." indicator with intermediate steps.
+
+**4. Context Window Management**
+When users had long purchase histories, the UserHistory tool output became very large. Solution: limit to the 10 most recent/relevant purchases, add a summarization step for users with 100+ purchases.
+
+**What You'd Improve:**
+- Add explicit memory: store the conversation so follow-up queries like "show me cheaper options" work
+- A/B test recommendation quality with real users (click-through rate)
+- Fine-tune an embedding model on fashion-specific data for better semantic similarity
+- Add a re-ranking step after vector search to improve relevance`,
+        keyPoints: [
+          'Non-determinism: mitigate with temperature=0 and explicit system prompt instructions',
+          'Embedding quality: include all descriptive fields, not just product name',
+          'Latency: streaming + caching + async reduces perceived wait time',
+          'Context length: limit history to recent/relevant items; summarize if needed',
+          'Production improvement: add conversation memory for follow-up queries',
+          'Evaluation: click-through rate and purchase rate are the real business metrics',
+        ],
+        interviewQs: [
+          {
+            q: 'What was the biggest technical challenge in this project and how did you solve it?',
+            a: 'The biggest challenge was embedding quality for product search. Initial embeddings used only product names, so semantic similarity was poor — "navy cargo pants" didn\'t match "utility trousers in dark blue" despite being equivalent. Solution: created richer embedding documents by concatenating product name + category + material + style tags + description. This gave the embedding model much more signal to work with. Similarity scores for equivalent items went from ~0.7 to ~0.92. Lesson: embedding quality is determined by the richness of the text you embed, not just the model you use.',
+          },
+          {
+            q: 'How would you scale this system to handle 10,000 concurrent users?',
+            a: 'Key bottlenecks and solutions: (1) LLM API calls — already handled by OpenAI\'s infrastructure; add request queuing to avoid rate limits. (2) Vector search — Pinecone or a self-hosted Weaviate cluster scales horizontally; FAISS won\'t work at this scale. (3) Backend — FastAPI with async handlers + horizontal scaling behind a load balancer (K8s or ECS). (4) Database — MongoDB Atlas with read replicas for user history. (5) Caching — Redis for user history (TTL=5min) and trending data (TTL=1hr) to reduce repeat DB/API calls. (6) Queue — for non-real-time requests, use a job queue (Celery + Redis) so the API returns immediately with a job ID and the result is fetched via polling or webhook.',
+          },
+        ],
+      },
+    ],
+  },
+
+  {
+    id: 'project-docqa',
+    number: 16,
+    title: 'Project: Intelligent Document Q&A System',
+    description: 'RAG-powered Q&A over large document collections — full deep dive',
+    icon: '📄',
+    color: '#06b6d4',
+    tag: 'Project Deep Dive',
+    sections: [
+      {
+        id: 'docqa-overview',
+        title: 'Project Overview & Problem Statement',
+        content: `This project solves a real enterprise problem: employees need to query large collections of internal documents (policies, manuals, reports) using natural language, without reading every document.
+
+**Problem Without This System:**
+A company has 500 PDFs of HR policies, product manuals, legal documents, and technical guides. An employee asks "What is the reimbursement limit for international travel?" They'd have to search manually through dozens of documents. This is slow, inconsistent, and scales poorly.
+
+**Solution — RAG-based Document Q&A:**
+Build a system where users ask questions in natural language and get accurate, cited answers grounded in the actual documents.
+
+**Architecture Overview:**
+\`\`\`
+Documents (PDFs, DOCX, URLs)
+       ↓
+[Document Loader] → raw text
+       ↓
+[Text Splitter] → chunks (500 tokens, 50 overlap)
+       ↓
+[Embedding Model] → vectors
+       ↓
+[Vector Store] → indexed embeddings + text
+       ↑ similarity search
+[Query] → embed → search → top-K chunks
+                                  ↓
+                         [LLM] + chunks → Answer + Citations
+\`\`\`
+
+**Key Design Decisions:**
+- Chunk size 500 tokens: balances retrieval precision with context richness
+- 50-token overlap: prevents answer loss at chunk boundaries
+- top-K=5: retrieves 5 chunks; more would overwhelm the context, fewer miss information
+- chain_type="stuff": concatenates all chunks directly into prompt (simplest approach)
+- Source attribution: return source document + page number with every answer`,
+        keyPoints: [
+          'Problem: natural language querying of large private document collections',
+          'RAG avoids LLM knowledge cutoff and context limit problems simultaneously',
+          'Two-phase: offline indexing (embed + store) and online query (retrieve + generate)',
+          'Chunk overlap prevents answers from being split across two non-retrieved chunks',
+          'Source attribution is a key feature — users can verify answers against originals',
+          'Enterprise use case: HR policies, legal documents, technical manuals, reports',
+        ],
+        interviewQs: [
+          {
+            q: 'Why not just put all the documents into the LLM context window?',
+            a: 'Three reasons: (1) Context window limits — even GPT-4\'s 128K window can hold roughly 300 pages. An enterprise document corpus may be thousands of pages. (2) Cost — 128K tokens per query costs ~$1.50 with GPT-4. With 500 employees querying daily, that\'s ~$750/day just for token costs, vs. ~$0.01/query with RAG that retrieves only 5 relevant chunks. (3) Quality — LLMs perform worse with very long contexts ("lost in the middle" problem — facts in the middle of a long context are retrieved less reliably). RAG focuses attention on the most relevant content.',
+          },
+          {
+            q: 'What document types did the system support and how did you handle each?',
+            a: 'Used LangChain document loaders for each type: (1) PDFs — PyPDFLoader or pdfplumber; handles multi-column layouts better. (2) DOCX — Docx2txtLoader. (3) URLs — WebBaseLoader with BeautifulSoup for HTML parsing. (4) CSVs — CSVLoader, treating each row as a document. Challenge: PDFs with scanned images have no extractable text — solved by integrating pytesseract OCR as a fallback. Challenge: tables in PDFs lose structure when extracted as plain text — partially mitigated by using camelot for table extraction and reformatting as markdown before chunking.',
+          },
+        ],
+      },
+      {
+        id: 'docqa-rag-impl',
+        title: 'RAG Implementation in Depth',
+        content: `Every component of the RAG pipeline has design choices that affect answer quality. Know the reasoning behind each decision.
+
+**Document Loading:**
+LangChain's document loaders handle format-specific parsing. Each loaded document has page_content (text) and metadata (source path, page number, creation date). Metadata is preserved through chunking and stored alongside embeddings — this enables citations.
+
+**Text Splitting Strategy:**
+RecursiveCharacterTextSplitter is the right default. It tries to split on: \\n\\n (paragraphs), then \\n (lines), then ". " (sentences), then " " (words), falling back to characters. This respects natural text boundaries.
+
+**Why 500 tokens?**
+- Too small (< 100 tokens): chunks lack context; the LLM can't generate a useful answer from a sentence fragment
+- Too large (> 1000 tokens): less precise retrieval; unrelated content from the same page gets retrieved together
+- 500 tokens ≈ 1–2 paragraphs: enough context, precise enough retrieval
+
+**Embedding Model Choice:**
+text-embedding-ada-002 (OpenAI): 1536 dimensions, strong general performance, $0.0001/1K tokens, API-based. For self-hosted: BAAI/bge-large-en-v1.5 (open source, competitive performance). The same model must be used for indexing and querying.
+
+**Retrieval Types:**
+- Similarity search (default): cosine similarity, returns top-K
+- MMR (Maximum Marginal Relevance): balances similarity with diversity — avoids returning 5 nearly-identical chunks
+- Threshold-based: only return chunks above a similarity score (e.g., 0.75) — reduces irrelevant retrievals
+
+**Chain Types:**
+- stuff: concatenate all chunks into one prompt. Simple, works for GPT-4 with its large context window
+- map_reduce: summarize each chunk independently, then combine. Used when chunks exceed context limit
+- refine: iteratively refine answer chunk by chunk. Highest quality but slowest`,
+        keyPoints: [
+          'RecursiveCharacterTextSplitter respects paragraph → sentence boundaries',
+          '500 tokens: sweet spot between retrieval precision and context richness',
+          'Metadata (source, page) preserved through chunking → enables citations',
+          'MMR retrieval improves diversity; avoid 5 near-identical chunks in context',
+          'stuff chain: simplest, concatenate all chunks; works well with GPT-4',
+          'Same embedding model MUST be used for both indexing and query time',
+        ],
+        codeExample: {
+          language: 'python',
+          label: 'Production-grade RAG pipeline',
+          code: `from pathlib import Path
+from langchain.document_loaders import PyPDFLoader, DirectoryLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import Chroma
+from langchain.chat_models import ChatOpenAI
+from langchain.chains import RetrievalQAWithSourcesChain
+from langchain.prompts import PromptTemplate
+
+# ── INDEXING PIPELINE ────────────────────────────────────────────────
+
+def build_index(docs_dir: str, persist_dir: str) -> Chroma:
+    # Load all PDFs in directory
+    loader = DirectoryLoader(docs_dir, glob="**/*.pdf",
+                             loader_cls=PyPDFLoader)
+    raw_docs = loader.load()
+    print(f"Loaded {len(raw_docs)} pages from {docs_dir}")
+
+    # Split into chunks
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=50,
+        separators=["\n\n", "\n", ". ", " ", ""],
+        length_function=len,
+    )
+    chunks = splitter.split_documents(raw_docs)
+    print(f"Created {len(chunks)} chunks")
+
+    # Embed and store
+    embeddings = OpenAIEmbeddings(model="text-embedding-ada-002")
+    vectorstore = Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        persist_directory=persist_dir,
+        collection_metadata={"hnsw:space": "cosine"}
+    )
+    vectorstore.persist()
+    print(f"Index built with {vectorstore._collection.count()} vectors")
+    return vectorstore
+
+# ── QUERY PIPELINE ───────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """You are a precise document assistant. Answer the question using ONLY the provided context.
+If the context doesn't contain enough information to answer, say "I don't have enough information in the documents to answer this."
+Always cite which document and page your answer comes from.
+
+Context:
+{summaries}
+
+Question: {question}
+
+Answer (with citations):"""
+
+def build_qa_chain(persist_dir: str):
+    embeddings = OpenAIEmbeddings(model="text-embedding-ada-002")
+    vectorstore = Chroma(
+        persist_directory=persist_dir,
+        embedding_function=embeddings
+    )
+
+    retriever = vectorstore.as_retriever(
+        search_type="mmr",          # diversity-aware retrieval
+        search_kwargs={"k": 5, "fetch_k": 20}
+    )
+
+    prompt = PromptTemplate(
+        template=SYSTEM_PROMPT,
+        input_variables=["summaries", "question"]
+    )
+
+    chain = RetrievalQAWithSourcesChain.from_chain_type(
+        llm=ChatOpenAI(model="gpt-4", temperature=0),
+        chain_type="stuff",
+        retriever=retriever,
+        chain_type_kwargs={"prompt": prompt},
+        return_source_documents=True
+    )
+    return chain
+
+# Usage
+chain = build_qa_chain("./chroma_db")
+result = chain({"question": "What is the reimbursement limit for international travel?"})
+
+print("Answer:", result["answer"])
+print("Sources:", result["sources"])
+print("\\nSource documents:")
+for doc in result["source_documents"]:
+    print(f"  - {doc.metadata['source']} page {doc.metadata.get('page', '?')}")`,
+        },
+        interviewQs: [
+          {
+            q: 'How did you ensure answers were accurate and not hallucinated?',
+            a: 'Multiple layers: (1) System prompt explicitly says "answer using ONLY the provided context" — this is the single most effective instruction. (2) Include an "I don\'t know" escape hatch — the model must say it when context is insufficient. (3) Return source citations — users can verify against the original document. (4) MMR retrieval reduces redundant chunks, giving the LLM broader context coverage. (5) Temperature=0 — eliminates creative variation in factual responses. (6) Evaluation set — created 50 Q&A pairs from known document content; measured faithfulness (answer grounded in context) using RAGAS. Iterated on prompt and chunking until faithfulness > 0.90.',
+          },
+        ],
+      },
+      {
+        id: 'docqa-eval',
+        title: 'Evaluation, Prompt Engineering & Quality Improvement',
+        content: `"Applied prompt engineering and evaluation techniques to reduce hallucinations" — this line on your resume will definitely be questioned. Have specifics.
+
+**Evaluation Framework:**
+You need a systematic way to know if the system is improving. For a Q&A system:
+
+1. **Create a test set:** 50+ question-answer pairs derived from the actual documents. The answers are ground truth from the documents.
+2. **Run the system** on all questions, collect responses
+3. **Measure:**
+   - **Faithfulness:** Is the answer supported by the retrieved chunks? (RAGAS measures this with an LLM judge)
+   - **Answer Relevancy:** Does the answer address the question? (semantic similarity between answer and question)
+   - **Context Precision:** Of retrieved chunks, what fraction were actually relevant?
+   - **Context Recall:** Of all relevant information, what fraction was retrieved?
+
+**Prompt Engineering Iterations:**
+Version 1 (naive): "Answer the question: {question}\\nContext: {context}"
+- Problem: model used prior knowledge instead of context; hallucinated confidently
+
+Version 2: Added "Use only the information in the context below"
+- Improvement: faithfulness increased from 0.62 to 0.81
+- Remaining problem: model still guessed when context was insufficient
+
+Version 3: Added explicit "I don't know" instruction + output format
+- Faithfulness: 0.81 → 0.91
+- "I don't know" responses on unanswerable questions: 12% → 78%
+
+Version 4: Added source citation requirement
+- Users could now verify answers, increasing trust
+- Discovered 3 categories of questions the system consistently got wrong → led to chunking improvements
+
+**Chunking Iteration:**
+Initial: 1000 token chunks, no overlap → retrieval often returned whole sections even when only one sentence was relevant
+Final: 500 token chunks, 50 overlap → more precise retrieval, faithfulness improved 0.08 points`,
+        keyPoints: [
+          'Evaluation set of 50+ Q&A pairs from known documents = ground truth for iteration',
+          'RAGAS metrics: Faithfulness, Answer Relevancy, Context Precision, Context Recall',
+          '"Use only the context" + "say I don\'t know" are the two most impactful prompt instructions',
+          'Prompt iteration sequence: naive → grounding instruction → I-don\'t-know → citations',
+          'Smaller chunks generally improve retrieval precision; overlap prevents boundary loss',
+          'Temperature=0 is non-negotiable for factual document Q&A',
+        ],
+        interviewQs: [
+          {
+            q: 'Walk me through how you evaluated and improved the Q&A system quality.',
+            a: 'Built a 50-question test set by manually selecting questions with verifiable answers from the document corpus. Baseline system (v1, naive prompt, 1000-token chunks): faithfulness score 0.62 — 38% of answers contained unsupported claims. Iteration 1: added explicit grounding instruction ("answer only from context"). Faithfulness 0.81. Iteration 2: added "I don\'t know" escape hatch. Faithfulness 0.88, unanswerable detection 78%. Iteration 3: reduced chunk size from 1000 to 500 tokens with 50-token overlap. Retrieval precision improved; faithfulness reached 0.91. Iteration 4: switched from similarity search to MMR retrieval — reduced redundant chunks, answer quality improved on multi-aspect questions. Final system: faithfulness 0.93, answer relevancy 0.88 on test set.',
+          },
+          {
+            q: 'What is RAGAS and how did you use it?',
+            a: 'RAGAS (Retrieval Augmented Generation Assessment) is an open-source framework for automated RAG evaluation. It uses an LLM judge to evaluate four metrics without requiring human annotation: Faithfulness (does the answer contain only facts from the retrieved context?), Answer Relevancy (does the answer address the question?), Context Precision (are the retrieved chunks relevant?), Context Recall (was all necessary information retrieved?). Usage: create a dataset with {question, answer, contexts, ground_truth}, call ragas.evaluate(). It returns metric scores. We ran it on our 50-question test set after each system change to measure improvement objectively rather than relying on subjective impressions.',
+          },
+        ],
+      },
+      {
+        id: 'docqa-prod',
+        title: 'Production Considerations & Scalability',
+        content: `Interviewers often ask "how would this work in production?" or "how would you scale this?". Have concrete answers for each layer.
+
+**Backend (FastAPI):**
+- Async endpoints: use async def with await for LLM calls — allows concurrent request handling
+- Connection pooling: reuse the Chroma client and LLM objects across requests (initialize once at startup, not per request)
+- Timeout handling: LLM calls can take 10–15 seconds; set explicit timeouts and return 504 if exceeded
+- Rate limiting: middleware to prevent abuse (especially important with costly LLM APIs)
+
+**Vector Database (Production):**
+- Chroma is fine for prototyping. For production with > 1M chunks: Pinecone (managed) or Weaviate (self-hosted, supports HNSW at scale)
+- Index partitioning: separate indexes per document collection / department for isolation and faster search
+- Update strategy: incremental upsert when documents change; don't rebuild entire index
+
+**LLM Cost Management:**
+- Caching: cache responses for repeated/similar questions with semantic similarity check (use Redis with question embeddings)
+- Model selection: use GPT-3.5-turbo for simple factual lookups (10x cheaper), GPT-4 only for complex multi-hop questions
+- Prompt compression: summarize retrieved chunks before including them (reduces tokens per query ~30%)
+
+**Security:**
+- Access control: users should only query documents they have permission to access — filter vector search results by user's allowed document IDs (metadata filtering)
+- Input sanitization: prevent prompt injection attacks where users embed instructions in queries
+- API key management: never hardcode; use environment variables, rotate regularly
+
+**Monitoring:**
+- Track: query latency, LLM token usage per query, retrieval precision (manual spot checks), error rates
+- Alert on: token usage spikes (cost), latency > 15s, error rate > 1%`,
+        keyPoints: [
+          'Initialize LLM client and vector store ONCE at startup, not per request',
+          'Async FastAPI handlers enable concurrent LLM request processing',
+          'Access control: filter vector search by user\'s allowed document IDs in metadata',
+          'Cost optimization: GPT-3.5 for simple queries, GPT-4 for complex; cache repeat queries',
+          'Prompt injection risk: users can embed instructions in queries — validate and sanitize',
+          'Monitoring: track latency, token usage, and error rate — set alerts for each',
+        ],
+        interviewQs: [
+          {
+            q: 'How would you add access control so users only see documents they\'re authorized for?',
+            a: 'Metadata filtering at the vector store level. When indexing documents, store the authorized user IDs or group/role in each chunk\'s metadata. At query time, pass a filter to the vector search: {"authorized_groups": {"$in": user.groups}}. Chroma, Pinecone, and Weaviate all support metadata filtering on similarity searches. This ensures retrieval only returns chunks from authorized documents. Additionally: maintain an authorization service that maps user roles to document collections; validate on every request. Audit log all queries and returned sources for compliance. Never rely solely on hiding documents — apply defense in depth.',
+          },
+          {
+            q: 'What would you change if you had to handle 1 million documents instead of 500?',
+            a: 'Key changes: (1) Vector DB: move from Chroma to Pinecone (managed) or Weaviate cluster — FAISS/Chroma don\'t scale to billions of vectors. (2) Indexing pipeline: move from synchronous to async batch processing with a job queue (Celery); index documents as they\'re uploaded rather than in a single batch. (3) Chunking: add document-level metadata and hierarchical indexing (index document summaries separately from chunks) to enable two-stage retrieval. (4) Query routing: classify queries first — route to the relevant document collection (HR vs Legal vs Tech) before searching all 1M chunks. (5) Caching: semantic query cache to avoid re-running expensive LLM calls for similar questions.',
+          },
+        ],
+      },
+    ],
+  },
 ];
